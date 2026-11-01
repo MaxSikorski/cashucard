@@ -240,7 +240,15 @@ test('a tip written through one OpsDb tipStore() seeds a fresh feed over the sam
 
   // A live fetch writes the last-good header through the REAL store.
   const live = new AnchorFeed(
-    async url => (url === TIP_URL ? Buffer.from('900000', 'ascii') : HEADER),
+    async url => {
+      if (url === TIP_URL) return Buffer.from('900000');
+      const hash = '0123456789abcdef'.repeat(4);
+      if (url === 'https://mempool.space/api/block-height/900000')
+        return Buffer.from(hash);
+      if (url === `https://mempool.space/api/block/${hash}/header`)
+        return Buffer.from(HEADER.toString('hex'));
+      throw new Error('unexpected url ' + url);
+    },
     () => 1_700_000_000,
     db.tipStore(),
   );

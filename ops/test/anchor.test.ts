@@ -9,6 +9,9 @@ import assert from 'node:assert/strict';
 import {AnchorFeed, CACHE_SECONDS, HEADER_LEN} from '../src/anchor';
 
 const HEADER = Buffer.alloc(HEADER_LEN, 0xab);
+const HASH = '0123456789abcdef'.repeat(4);
+const HASH_BODY = Buffer.from(HASH);
+const HEADER_BODY = Buffer.from(HEADER.toString('hex'));
 let clock = 1_000_000;
 
 function feed(
@@ -37,12 +40,14 @@ function feed(
 const heightOf = (h: number) => Buffer.from(String(h), 'ascii');
 const TIP_URL = 'https://mempool.space/api/blocks/tip/height';
 const blockUrl = (h: number) => `https://mempool.space/api/block-height/${h}`;
+const HEADER_URL = `https://mempool.space/api/block/${HASH}/header`;
 
 test('a good tip is an 80-byte header with its height', async () => {
   const f = feed(
     new Map([
       [TIP_URL, heightOf(900_000)],
-      [blockUrl(900_000), HEADER],
+      [blockUrl(900_000), HASH_BODY],
+      [HEADER_URL, HEADER_BODY],
     ]),
   );
   const r = await f.tip();
@@ -55,7 +60,8 @@ test('a wrong-length header is rejected (shape validation, cardctl parity)', asy
   const f = feed(
     new Map([
       [TIP_URL, heightOf(900_000)],
-      [blockUrl(900_000), Buffer.alloc(79)],
+      [blockUrl(900_000), HASH_BODY],
+      [HEADER_URL, Buffer.from('ab'.repeat(79))],
     ]),
   );
   const r = await f.tip();
@@ -67,7 +73,8 @@ test('the cache holds for CACHE_SECONDS, then refetches', async () => {
   const f = feed(
     new Map([
       [TIP_URL, heightOf(900_000)],
-      [blockUrl(900_000), HEADER],
+      [blockUrl(900_000), HASH_BODY],
+      [HEADER_URL, HEADER_BODY],
     ]),
   );
   const first = await f.tip();
@@ -82,15 +89,16 @@ test('the cache holds for CACHE_SECONDS, then refetches', async () => {
   assert.ok(third.ok);
   assert.equal(
     f.calls,
-    callsAfterFirst + 2,
-    'cache expired: height + header refetched',
+    callsAfterFirst + 3,
+    'cache expired: height + hash + header refetched',
   );
 });
 
 test('upstream failure answers the last-good header (503-shaped)', async () => {
   const responses = new Map<string, Buffer | Error>([
     [TIP_URL, heightOf(900_000)],
-    [blockUrl(900_000), HEADER],
+    [blockUrl(900_000), HASH_BODY],
+    [HEADER_URL, HEADER_BODY],
   ]);
   const f = feed(responses);
   const first = await f.tip();
@@ -179,16 +187,12 @@ test('a store row from before the height column (no height) does not seed', () =
 });
 
 test('a failed store write does not take the tip down', async () => {
-  const f = new AnchorFeed(
-    async url => (url === TIP_URL ? heightOf(900_000) : HEADER),
-    () => clock,
-    {
-      read: () => undefined,
-      write: () => {
-        throw new Error('disk full');
-      },
+  const f = new AnchorFeed(okFetcher, () => clock, {
+    read: () => undefined,
+    write: () => {
+      throw new Error('disk full');
     },
-  );
+  });
   const r = await f.tip();
   assert.ok(r.ok, 'the tip still answers with the store broken');
 });
@@ -198,7 +202,107 @@ async function okFetcher(url: string): Promise<Buffer> {
     return heightOf(900_000);
   }
   if (url === blockUrl(900_000)) {
-    return HEADER;
+    return HASH_BODY;
+  }
+  if (url === HEADER_URL) {
+    return HEADER_BODY;
   }
   throw new Error('unexpected url ' + url);
+}
+
+test('requests height, hash and hex header in order and decodes the header', async () => {
+  const urls: string[] = [];
+  const f = new AnchorFeed(async url => {
+    urls.push(url);
+    const response = await okFetcher(url);
+    return Buffer.from(`  ${response.toString().toUpperCase()}\n`);
+  });
+  const result = await f.tip();
+  assert.ok(result.ok);
+  assert.deepEqual(result.tip.header, HEADER);
+  assert.deepEqual(urls, [TIP_URL, blockUrl(900_000), HEADER_URL]);
+});
+
+for (const hash of [
+  '',
+  'a'.repeat(63),
+  'a'.repeat(65),
+  'g'.repeat(64),
+  '../header',
+]) {
+  test(`rejects malformed block hash ${JSON.stringify(hash)} before requesting a header`, async () => {
+    const f = feed(
+      new Map([
+        [TIP_URL, heightOf(900_000)],
+        [blockUrl(900_000), Buffer.from(hash)],
+      ]),
+    );
+    assert.deepEqual(await f.tip(), {ok: false, stale: null});
+    assert.equal(f.calls, 2);
+  });
+}
+
+for (const header of [
+  '',
+  'a'.repeat(159),
+  'a'.repeat(162),
+  'g'.repeat(160),
+  'ab'.repeat(79) + 'zz',
+]) {
+  test(`rejects malformed header ${JSON.stringify(header)}`, async () => {
+    const store = memoryStore();
+    const f = new AnchorFeed(
+      async url => (url === HEADER_URL ? Buffer.from(header) : okFetcher(url)),
+      () => clock,
+      store,
+    );
+    assert.deepEqual(await f.tip(), {ok: false, stale: null});
+    assert.equal(store.peek(), undefined);
+  });
+}
+
+for (const failedUrl of [blockUrl(900_000), HEADER_URL]) {
+  test(`failure at ${failedUrl} preserves the last-good header and persisted row`, async () => {
+    let now = 1_000_000;
+    let fail = false;
+    const store = memoryStore();
+    const f = new AnchorFeed(
+      async url => {
+        if (fail && url === failedUrl) throw new Error('upstream unavailable');
+        return okFetcher(url);
+      },
+      () => now,
+      store,
+    );
+    const first = await f.tip();
+    assert.ok(first.ok);
+    const saved = store.peek();
+    now += CACHE_SECONDS;
+    fail = true;
+    assert.deepEqual(await f.tip(), {ok: false, stale: first.tip});
+    assert.deepEqual(store.peek(), saved);
+  });
+}
+
+for (const invalidUrl of [blockUrl(900_000), HEADER_URL]) {
+  test(`malformed response at ${invalidUrl} cannot overwrite the last-good header`, async () => {
+    let now = 1_000_000;
+    let corrupt = false;
+    const store = memoryStore();
+    const f = new AnchorFeed(
+      async url => {
+        if (corrupt && url === invalidUrl) return Buffer.from('not-hex');
+        return okFetcher(url);
+      },
+      () => now,
+      store,
+    );
+    const first = await f.tip();
+    assert.ok(first.ok);
+    const saved = store.peek();
+    now += CACHE_SECONDS;
+    corrupt = true;
+    assert.deepEqual(await f.tip(), {ok: false, stale: first.tip});
+    assert.deepEqual(store.peek(), saved);
+  });
 }

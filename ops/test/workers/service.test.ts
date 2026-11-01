@@ -7,11 +7,11 @@
  * issue/escrow is one write, the tip route answers headerless, and the
  * escrow export round-trips through age.
  *
- * No network: the anchor routes answer 503 (no upstream in workerd tests).
+ * Anchor tests mock fetch explicitly; they never depend on a live upstream.
  */
 import {env} from 'cloudflare:workers';
 import {SELF} from 'cloudflare:test';
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it, vi} from 'vitest';
 
 const json = (res: Response) => res.json() as Promise<Record<string, unknown>>;
 
@@ -135,10 +135,47 @@ describe('ops on Workers (the DO)', () => {
   });
 
   it('GET /anchor/tip answers the headerless request (public route, 503 without upstream)', async () => {
-    const res = await SELF.fetch('http://x/anchor/tip', {method: 'GET'});
-    expect(res.status).toBe(503);
-    const body = await json(res);
-    expect(body.reason).toBe('upstream-unavailable');
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('upstream unavailable'));
+    try {
+      const res = await SELF.fetch('http://x/anchor/tip', {method: 'GET'});
+      expect(res.status).toBe(503);
+      const body = await json(res);
+      expect(body.reason).toBe('upstream-unavailable');
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
+  it('GET /anchor/tip resolves the block hash and returns the decoded header', async () => {
+    const hash = '0123456789abcdef'.repeat(4);
+    const header = 'ab'.repeat(80);
+    const responses = new Map([
+      ['https://mempool.space/api/blocks/tip/height', '900000'],
+      ['https://mempool.space/api/block-height/900000', hash],
+      [`https://mempool.space/api/block/${hash}/header`, header],
+    ]);
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async input => {
+        const response = responses.get(String(input));
+        if (response === undefined) throw new Error('unexpected upstream URL');
+        return new Response(response);
+      });
+    try {
+      const res = await SELF.fetch('http://x/anchor/tip');
+      expect(res.status).toBe(200);
+      const body = await json(res);
+      expect(body.header).toBe(header);
+      expect(body.height).toBe(900000);
+      expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+        ...responses.keys(),
+      ]);
+    } finally {
+      fetch.mockRestore();
+    }
   });
 
   it(

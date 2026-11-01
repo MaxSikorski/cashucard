@@ -15,6 +15,8 @@ export const CACHE_SECONDS = 60;
 const MEMPOOL_TIP = 'https://mempool.space/api/blocks/tip/height';
 const MEMPOOL_BLOCK = (height: number) =>
   `https://mempool.space/api/block-height/${height}`;
+const MEMPOOL_HEADER = (hash: string) =>
+  `https://mempool.space/api/block/${hash}/header`;
 
 export interface TipHeader {
   readonly header: Buffer;
@@ -86,12 +88,24 @@ export class AnchorFeed {
       if (!Number.isInteger(height) || height <= 0) {
         throw new UpstreamError('upstream height is not a number');
       }
-      const header = await this.fetcher(MEMPOOL_BLOCK(height));
-      if (header.length !== HEADER_LEN) {
-        throw new UpstreamError(
-          `tip header is ${header.length} bytes, not ${HEADER_LEN}`,
-        );
+      // Esplora resolves a height to a hash, not a binary block header.
+      const hash = (await this.fetcher(MEMPOOL_BLOCK(height)))
+        .toString('utf8')
+        .trim();
+      if (!/^[0-9a-f]{64}$/i.test(hash)) {
+        throw new UpstreamError('upstream block hash is not 32-byte hex');
       }
+      const headerHex = (await this.fetcher(MEMPOOL_HEADER(hash.toLowerCase())))
+        .toString('utf8')
+        .trim();
+      // Buffer.from(hex) silently truncates malformed hex: validate first.
+      if (
+        !/^[0-9a-f]+$/i.test(headerHex) ||
+        headerHex.length !== HEADER_LEN * 2
+      ) {
+        throw new UpstreamError('upstream block header is not 80-byte hex');
+      }
+      const header = Buffer.from(headerHex, 'hex');
       const tip: TipHeader = {header, fetchedAt: now, height};
       this.lastGood = tip;
       this.fetchedAt = now;
